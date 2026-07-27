@@ -1,0 +1,17 @@
+services:
+  hmtp:
+    build: .
+    container_name: hmtp
+    ports:
+      - "127.0.0.1:8025:8025"
+    volumes:
+      - ./data:/data
+    restart: unless-stopped
+
+  # Retries queued deliveries every 5 minutes (cron replacement).
+  flush:
+    build: .
+    entrypoint: ["sh", "-c", "while true; do sleep 300; python hmtp.py flush; done"]
+    volumes:
+      - ./data:/data
+    restart: unless-stopped
