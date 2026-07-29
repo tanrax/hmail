@@ -19,6 +19,7 @@ class FakeResponse:
     def __init__(self, response):
         self._response = response
         self.status_code = response.status_code
+        self.text = response.get_data(as_text=True)
 
     def json(self):
         return self._response.get_json()
@@ -275,6 +276,24 @@ def test_rotation_keeps_old_mail_readable(network, ana):
 
     _, _, msg = ana.stored_messages()[0]
     assert ana.open(msg)["subject"] == "before rotation"
+
+
+def test_rejected_mail_is_dropped_not_retried(network, ana, bob):
+    down = network.nodes.pop(bob.host)  # bob offline: the message gets queued
+    ana.run(hmtp.send, bob.address, "queued while down")
+    hmtp.HOME = ana.home
+    conn = hmtp.db()
+    mid, payload = conn.execute("SELECT id, payload FROM outbox").fetchone()
+    wire = json.loads(payload)
+    wire["date"] = "1999-12-31T23:59:59+00:00"  # breaks the signature: 401
+    conn.execute("UPDATE outbox SET payload = ? WHERE id = ?", (json.dumps(wire), mid))
+    conn.commit()
+
+    network.nodes[bob.host] = down  # bob comes back and rejects permanently
+    ana.run(hmtp.flush)
+
+    assert ana.rows("SELECT id FROM outbox") == []  # dropped, not requeued
+    assert bob.stored_messages() == []
 
 
 def test_queued_mail_is_delivered_on_flush(network, ana, bob):

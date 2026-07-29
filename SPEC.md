@@ -141,9 +141,12 @@ Responses:
 | `200` | duplicate: this `id` was already stored | done (a retry succeeded twice) |
 | `400` | malformed message or unsupported `v` | give up |
 | `401` | signature verification failed | give up |
+| `402` | reserved for postage (section 12); receivers MUST NOT send it in version 1 | give up |
 | `404` | unknown mailbox | give up |
 | `413` | message too large (reference node caps at 64 000 bytes) | give up |
 | `503` | receiver could not fetch the sender's keys right now | retry later |
+
+Retry semantics, also for codes not in the table: every `4xx` is a **permanent rejection** and the sender MUST drop the message instead of retrying it; transport failures and `5xx` responses (in practice `503`) are retryable.
 
 Store-and-forward lives on the **sender's** side: the client hands the signed message to its own node, and that node queues undeliverable copies and retries with exponential backoff (reference: 5 minutes doubling per attempt, capped at one day). Retries MUST resend the same message (same id), which makes them idempotent by construction.
 
@@ -223,9 +226,29 @@ An implementation that reproduces the id and the signature byte for byte (Ed2551
 
 ## 12. Out of scope in version 1
 
-Decided and documented, not implemented: signed key-rotation chains, `402` postage for strangers, attachments by reference, JMAP reading, multi-device.
+Decided and documented, not implemented: signed key-rotation chains, `402` postage for strangers, attachments by reference, JMAP reading (local to each node, outside interoperability scope), multi-device. The sketches below record the intended direction so version 1 implementations don't paint themselves into a corner; only the duties explicitly marked for version 1 are normative.
 
-### Attachments (design sketch, non-normative)
+### Key rotation and recovery
+
+Rotation already works in version 1 and imposes three duties on implementations:
+
+- Verifiers MUST fetch the discovery document live and MUST NOT pin or long-cache keys (section 2): publishing new keys **is** the whole rotation ceremony, and the new key is trusted instantly.
+- A node MUST retain its rotated-out encryption private keys, or sealed mail received before the rotation becomes unreadable (section 6).
+- Know the limit: a stored signature is only re-verifiable while the signing key that produced it is still the published one. After a rotation, stored mail keeps its signature but can no longer be validated against the sender's domain.
+
+The chain (future): the discovery document would grow a list of rotation entries, each new key signed by the previous one, so anyone who knew key N can verify key N+1 without trusting the server, and historical signatures stay verifiable against the chain. For recovery after losing a key (no signed handover possible), the domain would publish a chainless key with a mandatory announcement window during which receivers warn that the identity was re-anchored by domain, not by signature. Precedents: Keybase sigchains, and ATProto's `did:plc`, which keeps a hierarchy of rotation keys and a 72-hour window in which a higher-priority key can undo an operation.
+
+### Postage (`402`)
+
+Normative for version 1: receivers MUST NOT answer a delivery with `402`, and a sender that receives one MUST treat it as a permanent rejection (section 7), never as retryable. Reserving this now keeps version 1 nodes forward-compatible with postage.
+
+The sketch: a receiver MAY answer a **first contact** (sender not in its contacts) with `402` plus machine-readable payment terms in a `WWW-Authenticate` challenge; the sender pays and re-sends the *same* message (same id) with proof of payment attached. Configurable per mailbox: the cost of cold contact stops being zero while accepted contacts keep writing for free. Precedent: L402, which pairs the `402` status with a macaroon-plus-invoice challenge in exactly this request, pay, retry shape.
+
+### Multi-device
+
+The article's discovery example reserves a `devices` field that version 1 omits on purpose. The direction: the discovery document would publish one encryption key per device and the sender would seal one copy of the content to each key. The id, being a hash of the plaintext, is unaffected; the shape of `sealed` is what a future version would extend, under a new `v`. The duty this leaves on version 1 is extensibility: implementations MUST ignore unknown fields in discovery documents and messages rather than reject them.
+
+### Attachments
 
 Version 1 messages are text only, capped by the receiver's size limit. The designed mechanism keeps attachments **outside the message**, by reference:
 

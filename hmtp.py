@@ -256,13 +256,20 @@ def inbox(user: str):
     return jsonify(delivered=msg["id"]), 201 if inserted else 200
 
 
+class PermanentRejection(Exception):
+    """A 4xx from the receiver: retrying the same message cannot succeed."""
+
+
 def post_message(inbox_url: str, wire: dict) -> None:
-    httpx.post(
+    response = httpx.post(
         inbox_url,
         content=json.dumps(wire),
         headers={"Content-Type": "application/hmtp+json"},
         timeout=10,
-    ).raise_for_status()
+    )
+    if 400 <= response.status_code < 500:
+        raise PermanentRejection(f"{response.status_code} {response.text[:100]}")
+    response.raise_for_status()
 
 
 def deliver(recipient: str, wire: dict) -> None:
@@ -313,6 +320,8 @@ def send(
             raise ValueError("recipient node unreachable")
         post_message(doc["inbox"], wire)
         print(f"delivered {wire['id']}")
+    except PermanentRejection as exc:
+        print(f"rejected, not retrying ({exc})")
     except PEER_ERRORS as exc:
         conn.execute(
             "INSERT OR IGNORE INTO outbox VALUES (?, ?, ?, 0, 0)",
@@ -337,6 +346,9 @@ def flush() -> None:
             deliver(recipient, json.loads(payload))
             conn.execute("DELETE FROM outbox WHERE id = ?", (mid,))
             print(f"delivered {mid}")
+        except PermanentRejection as exc:
+            conn.execute("DELETE FROM outbox WHERE id = ?", (mid,))
+            print(f"dropped {mid}, rejected ({exc})")
         except PEER_ERRORS:
             delay = min(300 * 2**attempts, MAX_BACKOFF)
             conn.execute(
