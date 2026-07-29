@@ -11,7 +11,7 @@ services:
   # Retries queued deliveries every 5 minutes (cron replacement).
   flush:
     build: .
-    entrypoint: ["sh", "-c", "while true; do sleep 300; python hmtp.py flush; done"]
+    entrypoint: ["sh", "-c", "while true; do sleep 300; hmtp flush; done"]
     volumes:
       - ./data:/data
     restart: unless-stopped

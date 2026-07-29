@@ -1,6 +1,6 @@
 # HMTP
 
-**HTTP Mail Transfer Protocol**: a minimal self-hosted mail node over HTTP. One file, no SMTP.
+**HTTP Mail Transfer Protocol**: a minimal self-hosted mail node over HTTP. No SMTP.
 
 Protocol specification: [SPEC.md](SPEC.md)
 
@@ -27,6 +27,26 @@ Version 1 also covers encrypted attachments by reference (blobs mirrored by the 
 
 The exact wire format (canonical JSON, ids, signatures, sealing, attachments, postage, rotation, status codes, verification duties) is specified in [SPEC.md](SPEC.md), including a test vector for writing interoperable implementations in other languages. Read the article [Modern email can be built from borrowed parts](https://en.andros.dev/blog/d7ed8b07/modern-email-can-be-built-from-borrowed-parts/) for the design rationale.
 
+## Architecture
+
+The codebase follows clean architecture: business logic in `core`, the outside world in `infra`, dependencies always pointing inwards. Use cases receive their gateways (storage, network, blob store, config) as injected interfaces and return plain dictionaries (`{type, errors, data}`); exceptions never cross a layer boundary.
+
+```
+hmtp/
+  core/
+    entities/     # constants, canonical JSON, ids, crypto: pure logic
+    gateways/     # Protocols the use cases depend on
+    use_cases/    # one file per operation: send, receive, rotate, accept...
+  infra/
+    database/     # SQLite repository
+    filesystem/   # config.json and blob storage
+    gateways/     # httpx network client (SSRF guard lives here)
+    api/flask/    # the HTTP node: discovery, inbox, mailbox, blobs
+    cli/click/    # the command line
+```
+
+Swapping Flask, SQLite or httpx touches only `infra`; the protocol logic and its tests never change.
+
 ## Quickstart
 
 ### 0. Prerequisites
@@ -38,14 +58,14 @@ git clone https://github.com/tanrax/hmtp.git
 cd hmtp
 ```
 
-**Option A: uv (recommended).** Dependencies are declared inline in the script (PEP 723), so there is nothing to install: `uv run hmtp.py ...` resolves them on first use. The examples below use this form.
+**Option A: uv (recommended).** There is nothing to install: `uv run hmtp ...` resolves the project and its dependencies on first use. The examples below use this form.
 
-**Option B: plain Python (3.11+).** Create a virtualenv, install the three dependencies, and use `python hmtp.py ...` wherever the examples say `uv run hmtp.py ...`:
+**Option B: plain Python (3.11+).** Create a virtualenv, install the project, and use `hmtp ...` (or `.venv/bin/hmtp ...` without activating) wherever the examples say `uv run hmtp ...`:
 
 ```bash
 python3 -m venv .venv
 source .venv/bin/activate
-pip install -r requirements.txt
+pip install -e .
 ```
 
 **Option C: Docker.** No Python on the host at all; see [Docker](#docker) below.
@@ -54,8 +74,8 @@ pip install -r requirements.txt
 
 ```bash
 export HMTP_INSECURE=1   # local test only: plain HTTP, SSRF guard off
-uv run hmtp.py init me@localhost:8025 http://localhost:8025
-uv run hmtp.py serve
+uv run hmtp init me@localhost:8025 http://localhost:8025
+uv run hmtp serve
 ```
 
 Leave `serve` running. Your node now publishes your address and signing key at `http://localhost:8025/.well-known/hmtp/me` and accepts deliveries on `/hmtp/inbox/me`.
@@ -65,7 +85,7 @@ Leave `serve` running. Your node now publishes your address and signing key at `
 In another terminal (also with `HMTP_INSECURE=1` exported):
 
 ```bash
-uv run hmtp.py send me@localhost:8025 "Hello, world. Signed and delivered."
+uv run hmtp send me@localhost:8025 "Hello, world. Signed and delivered."
 # delivered sha256:a39442a5ad64f1351892200b41da1b21f332de9fb234d54727c2e0ddefef5f6e
 ```
 
@@ -74,14 +94,14 @@ Yes, you just mailed yourself, and that exercised the whole protocol: the sender
 ### 3. Read your mail
 
 ```bash
-uv run hmtp.py list
+uv run hmtp list
 # == inbox ==
 # [2026-07-27T05:49:46+00:00] me@localhost:8025  (sha256:a39442a5ad64)
 #   Hello, world. Signed and delivered.
 # == requests ==
 ```
 
-Mail from senders you never wrote to lands in `requests` instead of `inbox`; promote a sender with `uv run hmtp.py accept <address>`. Reply to any message with `uv run hmtp.py reply <message-id> <text>` (the id is the `sha256:` shown by `list`): the reply carries the thread reference and a `Re:` subject. Subjects go on new mail with `-s`: `uv run hmtp.py send <address> -s "Subject" <text>`. If a delivery fails because the destination node is down, it is queued; `uv run hmtp.py flush` retries with exponential backoff.
+Mail from senders you never wrote to lands in `requests` instead of `inbox`; promote a sender with `uv run hmtp accept <address>`. Reply to any message with `uv run hmtp reply <message-id> <text>` (the id is the `sha256:` shown by `list`): the reply carries the thread reference and a `Re:` subject. Subjects go on new mail with `-s`: `uv run hmtp send <address> -s "Subject" <text>`. If a delivery fails because the destination node is down, it is queued; `uv run hmtp flush` retries with exponential backoff.
 
 For a real conversation between two different mailboxes, see the demo below.
 
@@ -93,29 +113,29 @@ Create both identities:
 
 ```bash
 export HMTP_INSECURE=1
-HMTP_HOME=/tmp/hmtp-a uv run hmtp.py init ana@localhost:8025 http://localhost:8025
-HMTP_HOME=/tmp/hmtp-b uv run hmtp.py init bob@localhost:8026 http://localhost:8026
+HMTP_HOME=/tmp/hmtp-a uv run hmtp init ana@localhost:8025 http://localhost:8025
+HMTP_HOME=/tmp/hmtp-b uv run hmtp init bob@localhost:8026 http://localhost:8026
 ```
 
 Run each node in its own terminal:
 
 ```bash
-HMTP_HOME=/tmp/hmtp-a uv run hmtp.py serve 8025
-HMTP_HOME=/tmp/hmtp-b uv run hmtp.py serve 8026
+HMTP_HOME=/tmp/hmtp-a uv run hmtp serve 8025
+HMTP_HOME=/tmp/hmtp-b uv run hmtp serve 8026
 ```
 
 And in a third terminal (also with `HMTP_INSECURE=1`):
 
 ```bash
 # Ana writes to Bob. Bob doesn't know her, so it lands in requests
-HMTP_HOME=/tmp/hmtp-a uv run hmtp.py send bob@localhost:8026 "Hi Bob, testing hmtp"
-HMTP_HOME=/tmp/hmtp-b uv run hmtp.py list
+HMTP_HOME=/tmp/hmtp-a uv run hmtp send bob@localhost:8026 "Hi Bob, testing hmtp"
+HMTP_HOME=/tmp/hmtp-b uv run hmtp list
 
 # Bob accepts Ana and replies. Ana already welcomed his replies
 # (writing to someone accepts their answers), so it goes straight to her inbox
-HMTP_HOME=/tmp/hmtp-b uv run hmtp.py accept ana@localhost:8025
-HMTP_HOME=/tmp/hmtp-b uv run hmtp.py send ana@localhost:8025 "Hi Ana, received and signed"
-HMTP_HOME=/tmp/hmtp-a uv run hmtp.py list
+HMTP_HOME=/tmp/hmtp-b uv run hmtp accept ana@localhost:8025
+HMTP_HOME=/tmp/hmtp-b uv run hmtp send ana@localhost:8025 "Hi Ana, received and signed"
+HMTP_HOME=/tmp/hmtp-a uv run hmtp list
 ```
 
 To see store and forward in action: kill Bob's node, send from Ana (you will see `queued (recipient node unreachable)`), start Bob's node again and run `flush` on Ana's side. The message gets delivered. In production that `flush` lives in a cron entry, with exponential backoff between attempts.
@@ -180,13 +200,13 @@ Clone the repo on the server (e.g. into `/opt/hmtp`) and initialize with your re
 With uv:
 
 ```bash
-uv run hmtp.py init you@yourdomain.com https://yourdomain.com
+uv run hmtp init you@yourdomain.com https://yourdomain.com
 ```
 
 With plain Python (create the venv as in the quickstart first):
 
 ```bash
-.venv/bin/python hmtp.py init you@yourdomain.com https://yourdomain.com
+.venv/bin/hmtp init you@yourdomain.com https://yourdomain.com
 ```
 
 With Docker:
@@ -215,7 +235,7 @@ After=network.target
 [Service]
 User=you
 WorkingDirectory=/opt/hmtp
-ExecStart=/usr/local/bin/uv run hmtp.py serve
+ExecStart=/usr/local/bin/uv run hmtp serve
 Restart=on-failure
 
 [Install]
@@ -225,7 +245,7 @@ WantedBy=multi-user.target
 **With plain Python.** The same unit, with this `ExecStart` instead:
 
 ```ini
-ExecStart=/opt/hmtp/.venv/bin/python hmtp.py serve
+ExecStart=/opt/hmtp/.venv/bin/hmtp serve
 ```
 
 Then enable it:
@@ -243,13 +263,13 @@ Docker users already have the `flush` sidecar. Otherwise, one cron line (`cronta
 With uv:
 
 ```bash
-*/5 * * * * cd /opt/hmtp && /usr/local/bin/uv run hmtp.py flush
+*/5 * * * * cd /opt/hmtp && /usr/local/bin/uv run hmtp flush
 ```
 
 With plain Python:
 
 ```bash
-*/5 * * * * cd /opt/hmtp && .venv/bin/python hmtp.py flush
+*/5 * * * * cd /opt/hmtp && .venv/bin/hmtp flush
 ```
 
 ### 7. Verify
@@ -266,15 +286,15 @@ And from the server, mail yourself through the full public loop (discovery, sign
 With uv:
 
 ```bash
-uv run hmtp.py send you@yourdomain.com "production ping"
-uv run hmtp.py list
+uv run hmtp send you@yourdomain.com "production ping"
+uv run hmtp list
 ```
 
 With plain Python:
 
 ```bash
-.venv/bin/python hmtp.py send you@yourdomain.com "production ping"
-.venv/bin/python hmtp.py list
+.venv/bin/hmtp send you@yourdomain.com "production ping"
+.venv/bin/hmtp list
 ```
 
 With Docker:
@@ -287,7 +307,7 @@ docker compose run --rm hmtp list
 ### 8. Rotate your keys when you need to
 
 ```bash
-uv run hmtp.py rotate
+uv run hmtp rotate
 ```
 
 One command, no coordination with anyone. Because receivers fetch your current key from your domain on every delivery (nothing is pinned), the new signing key is trusted by the whole network the moment the command returns, and the old one becomes useless to a thief just as instantly. The rotation also keeps your old encryption keys in `config.json` so `list` can still decrypt mail that was sealed to them, and re-signs any queued outgoing mail so it will verify against the new published key. Rotate on a schedule, after restoring a backup onto a new machine, or whenever you suspect a key leaked.
@@ -297,27 +317,27 @@ You are now a mail server. Total moving parts: Nginx, one script, SQLite.
 ## Commands
 
 ```
-hmtp.py init <address> <public-base-url>       create identity and database
-hmtp.py serve [port]                           run the node (default 8025)
-hmtp.py send <address> [-s <subject>] [-a <file>]... [--stamp <token>] <text>
-hmtp.py reply <message-id> <text>              reply to a message (threaded)
-hmtp.py attachments <message-id> [dir]         save and decrypt attachments
-hmtp.py flush                                  retry queued deliveries
-hmtp.py list                                   show inbox and contact requests
-hmtp.py accept <address>                       accept a contact request
-hmtp.py rotate                                 replace signing and encryption keys
-hmtp.py postage on|off                         require stamps from strangers
-hmtp.py stamp                                  issue a single-use postage stamp
-hmtp.py token                                  print the mailbox read token
-hmtp.py device keygen                          generate a key pair for a device
-hmtp.py device add <name> <public-key>         publish a device encryption key
+hmtp init <address> <public-base-url>       create identity and database
+hmtp serve [port]                           run the node (default 8025)
+hmtp send <address> [-s <subject>] [-a <file>]... [--stamp <token>] <text>
+hmtp reply <message-id> <text>              reply to a message (threaded)
+hmtp attachments <message-id> [dir]         save and decrypt attachments
+hmtp flush                                  retry queued deliveries
+hmtp list                                   show inbox and contact requests
+hmtp accept <address>                       accept a contact request
+hmtp rotate                                 replace signing and encryption keys
+hmtp postage on|off                         require stamps from strangers
+hmtp stamp                                  issue a single-use postage stamp
+hmtp token                                  print the mailbox read token
+hmtp device keygen                          generate a key pair for a device
+hmtp device add <name> <public-key>         publish a device encryption key
 ```
 
 State lives in `$HMTP_HOME` (default `~/.hmtp`): `config.json` holds your keys, `hmtp.db` holds your mail. Back up both.
 
 ## What is deliberately left out
 
-The remaining edges, listed in SPEC.md section 16: full JMAP synchronization (the read endpoint is deliberately minimal), payment rails for stamps (issuance is out of band), chunked encryption for large attachments, automated device enrollment, and timed re-anchor announcements. Everything else is in: end-to-end encryption of subject, body and attachments, threading, first-contact consent, postage for strangers, deduplication, exponential backoff, a signing-key rotation chain with continuity pins, multi-device copies, a production WSGI server. It still fits in one file you can read in one sitting. A protocol you cannot extend on a Sunday afternoon would not deserve the experiment.
+The remaining edges, listed in SPEC.md section 16: full JMAP synchronization (the read endpoint is deliberately minimal), payment rails for stamps (issuance is out of band), chunked encryption for large attachments, automated device enrollment, and timed re-anchor announcements. Everything else is in: end-to-end encryption of subject, body and attachments, threading, first-contact consent, postage for strangers, deduplication, exponential backoff, a signing-key rotation chain with continuity pins, multi-device copies, a production WSGI server. Each use case still fits on one screen, and the whole core reads in one sitting. A protocol you cannot extend on a Sunday afternoon would not deserve the experiment.
 
 ## License
 
