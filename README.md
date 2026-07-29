@@ -47,6 +47,49 @@ hmtp/
 
 Swapping Flask, SQLite or httpx touches only `infra`; the protocol logic and its tests never change.
 
+```mermaid
+flowchart LR
+    subgraph infra["infra (external interfaces)"]
+        C["CLI with Click"]
+        F["HTTP node with Flask"]
+        S[("SQLite / files / httpx")]
+    end
+    subgraph core["core (business logic)"]
+        U["use cases"]
+        P["gateway Protocols"]
+        E["entities: canonical JSON, ids, crypto"]
+    end
+    C --> U
+    F --> U
+    U --> E
+    U --> P
+    P -. implemented by .-> S
+```
+
+## How a delivery travels
+
+The whole protocol fits in one exchange: two GETs to `.well-known` (discovery and verification), one POST (the delivery), and a queue on the sender's side when the destination is down.
+
+```mermaid
+sequenceDiagram
+    autonumber
+    participant Ana as Ana's client
+    participant SA as Ana's node
+    participant SB as Bob's node
+
+    Ana->>SA: hmtp send (sign + seal)
+    SA->>SB: GET /.well-known/hmtp/bob
+    SB-->>SA: inbox, keys, rotations
+    SA->>SB: POST /hmtp/inbox/bob (envelope + sealed content)
+    Note over SB: down: no response
+    Note over SA: queued: exponential backoff
+    SA->>SB: POST /hmtp/inbox/bob (retry, same id)
+    SB->>SA: GET /.well-known/hmtp/ana
+    SA-->>SB: Ana's signing key + rotation chain
+    Note over SB: signature verified, key continuity checked,<br/>deduplicated by id
+    SB-->>SA: 201 delivered
+```
+
 ## Quickstart
 
 ### 0. Prerequisites

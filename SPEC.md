@@ -162,6 +162,32 @@ Attachments live **outside the message**, by reference, encrypted end to end:
 - The sealed references and the visible list MUST agree on the `(hash, size)` pairs; a mismatch means the sender told the server and the recipient different stories, and the attachments MUST be refused.
 - Verify the blob's size and hash before decrypting; treat the `name` as untrusted (strip any path components).
 
+The full lifecycle (non-normative illustration):
+
+```mermaid
+sequenceDiagram
+    autonumber
+    participant SA as Sender's node
+    participant SB as Recipient's node
+    participant C as Recipient's client
+
+    Note over SA: encrypt file with a single-use key<br/>blob = nonce || ciphertext<br/>serve blob at its hash
+    SA->>SB: POST message: visible refs (hash, url, size)<br/>sealed refs add name and key
+    alt sender is an accepted contact
+        SB->>SA: GET blob url
+        SA-->>SB: opaque blob
+        Note over SB: verify size and hash, store mirror
+        SB-->>SA: 201 delivered, mirrored: [hash]
+    else stranger (requests box)
+        SB-->>SA: 201 delivered, mirrored: []
+        Note over SB: mirroring deferred until accept
+    end
+    C->>SB: read mail, unseal content
+    Note over C: sealed refs must match visible refs
+    C->>SB: read mirrored blob
+    Note over C: verify hash, decrypt with the sealed key
+```
+
 ## 8. Delivery
 
 Delivery is one HTTP request per recipient copy:
@@ -202,7 +228,20 @@ A stamp is an opaque single-use token issued by the recipient's node and distrib
 Authorization: HMTP-Stamp <token>
 ```
 
-The receiver consumes the stamp on acceptance: a second use is `402` again. Accepted contacts never need stamps. The shape (402, `WWW-Authenticate` challenge, pay out of band, retry with proof) follows the L402 pattern.
+The receiver consumes the stamp on acceptance: a second use is `402` again. Accepted contacts never need stamps. The shape (402, `WWW-Authenticate` challenge, pay out of band, retry with proof) follows the L402 pattern:
+
+```mermaid
+sequenceDiagram
+    participant S as Stranger's node
+    participant R as Recipient's node
+
+    S->>R: POST message (no stamp)
+    R-->>S: 402 + WWW-Authenticate: HMTP-Stamp
+    Note over S,R: out of band: the recipient hands<br/>a single-use stamp to the sender
+    S->>R: POST the same message (same id)<br/>Authorization: HMTP-Stamp token
+    Note over R: stamp valid and unused: consumed
+    R-->>S: 201 delivered
+```
 
 **Store-and-forward** lives on the **sender's** side: the client hands the signed message to its own node, and that node queues undeliverable copies and retries with exponential backoff (reference: 5 minutes doubling per attempt, capped at one day). Retries MUST resend the same message (same id), which makes them idempotent by construction.
 
@@ -228,6 +267,42 @@ The receiver consumes the stamp on acceptance: a second use is `402` again. Acce
 
 The split matters: the server authenticates *who sent it and that nothing was altered in transit*; the recipient additionally verifies *that the id really names this plaintext*.
 
+The server pipeline as a decision tree (non-normative illustration):
+
+```mermaid
+flowchart TD
+    A["POST /hmtp/inbox/user"] --> B{"mailbox known?"}
+    B -- no --> B4["404"]
+    B -- yes --> C{"within size cap?"}
+    C -- no --> C4["413"]
+    C -- yes --> D{"v supported?"}
+    D -- no --> D4["400"]
+    D -- yes --> E{"shape valid?"}
+    E -- no --> E4["400"]
+    E -- yes --> F{"plaintext content:<br/>does id match?"}
+    F -- no --> F4["401"]
+    F -- yes or sealed --> G["fetch sender's discovery document"]
+    G -- unreachable --> G5["503: sender retries later"]
+    G -- ok --> H{"signature valid?"}
+    H -- no --> H4["401"]
+    H -- yes --> I{"postage required<br/>and sender unknown<br/>and no valid stamp?"}
+    I -- yes --> I4["402 + WWW-Authenticate"]
+    I -- no --> J{"key continuity holds?"}
+    J -- no --> R["box = requests"]
+    J -- yes --> K{"sender is a contact?"}
+    K -- yes --> IB["box = inbox"]
+    K -- no --> R
+    IB --> L{"id already stored?"}
+    R --> L
+    L -- yes --> L2["200 duplicate"]
+    L -- no --> M["store message"]
+    M --> N{"box = inbox?"}
+    N -- yes --> O["mirror attachments"]
+    N -- no --> P["defer mirroring until accept"]
+    O --> Q["201 delivered + mirrored list"]
+    P --> Q
+```
+
 ## 10. Consent (receiver policy)
 
 Receivers SHOULD keep a contacts set per mailbox:
@@ -249,6 +324,18 @@ This is local policy, not wire format: nodes with different consent rules still 
 - If the pinned key is not in the chain, or any hop fails, the identity was **re-anchored by the domain, not by a signature** (lost key, expired domain, hostile takeover: the receiver cannot tell). Version 1's response is demotion: the mail is delivered to the requests box even if the sender was an accepted contact, and consent must be earned again. Accepting the sender re-pins whatever the domain publishes now.
 
 Continuity protects established relationships, not first contact: the first pin is trust-on-first-use. A stored signature is only re-verifiable against keys still published in the chain.
+
+The decision, per verified delivery (non-normative illustration):
+
+```mermaid
+flowchart TD
+    A["verified delivery from sender S"] --> B{"pin stored for S?"}
+    B -- "no pin" --> C["pin the current key"] --> OK["continuity holds"]
+    B -- "pin equals current key" --> OK
+    B -- "key changed" --> D{"pinned key appears in the chain,<br/>every later hop is signed<br/>by the previous key,<br/>and the last hop is the current key?"}
+    D -- yes --> E["update the pin"] --> OK
+    D -- no --> RA["re-anchored by domain, not by signature:<br/>demote to requests until accepted again"]
+```
 
 ## 12. Reading
 
