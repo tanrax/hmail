@@ -65,7 +65,9 @@ def network(tmp_path, monkeypatch):
     client = hmtp.app.test_client()
     wires = []
 
-    def dispatch(url, method, payload=None):
+    content_types = []
+
+    def dispatch(url, method, body=None, content_type=None):
         host, _, path = url.split("://", 1)[1].partition("/")
         target = nodes[host]  # KeyError = host down, a PEER_ERRORS member
         caller_home = hmtp.HOME
@@ -73,7 +75,9 @@ def network(tmp_path, monkeypatch):
         try:
             if method == "get":
                 return FakeResponse(client.get(f"/{path}"))
-            return FakeResponse(client.post(f"/{path}", json=payload))
+            return FakeResponse(
+                client.post(f"/{path}", data=body, content_type=content_type)
+            )
         finally:
             hmtp.HOME = caller_home
 
@@ -81,9 +85,10 @@ def network(tmp_path, monkeypatch):
         hmtp.httpx, "get", lambda url, timeout=None: dispatch(url, "get")
     )
 
-    def fake_post(url, json=None, timeout=None):
-        wires.append(json)
-        return dispatch(url, "post", json)
+    def fake_post(url, content=None, headers=None, timeout=None):
+        wires.append(json.loads(content))
+        content_types.append(headers["Content-Type"])
+        return dispatch(url, "post", content, headers["Content-Type"])
 
     monkeypatch.setattr(hmtp.httpx, "post", fake_post)
 
@@ -92,7 +97,13 @@ def network(tmp_path, monkeypatch):
         nodes[node.host] = node
         return node
 
-    return SimpleNamespace(make=make, nodes=nodes, wires=wires, client=client)
+    return SimpleNamespace(
+        make=make,
+        nodes=nodes,
+        wires=wires,
+        content_types=content_types,
+        client=client,
+    )
 
 
 @pytest.fixture()
@@ -178,6 +189,35 @@ def test_reply_threads_by_id_and_prefixes_subject(network, ana, bob):
     assert ana.open(msg)["subject"] == "Re: operation midnight"
 
 
+def test_wire_declares_version_and_media_type(network, ana, bob):
+    ana.run(hmtp.send, bob.address, "hello")
+
+    assert network.wires[-1]["v"] == hmtp.VERSION
+    assert network.content_types[-1] == "application/hmtp+json"
+
+
+def test_unsupported_version_is_rejected(network, ana, bob):
+    ana.run(hmtp.send, bob.address, "hello")
+    wire = dict(network.wires[-1])
+
+    wire["v"] = 99
+
+    assert post_to(network, bob, wire).status_code == 400
+
+
+def test_canonical_form_is_sorted_compact_utf8():
+    assert hmtp.canonical({"b": 1, "a": "café"}) == '{"a":"café","b":1}'.encode()
+
+
+def test_message_with_both_sealed_and_content_is_rejected(network, ana, bob):
+    ana.run(hmtp.send, bob.address, "hello")
+    wire = dict(network.wires[-1])
+
+    wire["content"] = {"subject": "", "body": "decoy", "salt": hmtp.b64(b"y" * 16)}
+
+    assert post_to(network, bob, wire).status_code == 400
+
+
 def test_tampered_envelope_is_rejected(network, ana, bob):
     ana.run(hmtp.send, bob.address, "hello")
     wire = dict(network.wires[-1])
@@ -200,6 +240,7 @@ def test_lying_id_is_detected_by_the_recipient(network, ana, bob):
     )
     content = {"subject": "", "body": "real text", "salt": hmtp.b64(b"x" * 16)}
     payload = {
+        "v": hmtp.VERSION,
         "from": ana.address,
         "to": [bob.address],
         "date": "2026-07-29T10:00:00+00:00",

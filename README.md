@@ -2,6 +2,8 @@
 
 **HTTP Mail Transfer Protocol**: a minimal self-hosted mail node over HTTP. One file, no SMTP.
 
+Protocol specification: [SPEC.md](SPEC.md)
+
 HMTP is a thought experiment turned into working code: what would email look like if it were designed today, on top of the tools we already have? Nothing in this node is invented; every piece is a standard already deployed at scale:
 
 | Problem | Existing technology | Who uses it today |
@@ -21,7 +23,7 @@ It never talks to SMTP: it only federates with other HMTP nodes.
 
 Your identity is `user@domain`. The domain serves `GET /.well-known/hmtp/<user>` with your inbox URL and your public keys (this doubles as an MX record: the inbox can live on any host). A message is a visible envelope `{from, to, date}` plus a sealed payload carrying the subject and the body, encrypted to the recipient's X25519 key (ChaCha20-Poly1305): the receiving server stores ciphertext it cannot read, and the subject travels as protected as the body (PGP left it in the clear for decades; we don't). The `id` is the SHA-256 of the canonical plaintext, computed before sealing, so every copy of a message shares the same id, thread references match across nodes and retries are idempotent. The Ed25519 `signature` covers the envelope, the id and the ciphertext: the receiver fetches the sender's key from the sender's domain and verifies before accepting, and the recipient re-checks the id against the plaintext after unsealing. Delivery is a `POST` to the recipient's inbox. `201` delivered, `200` duplicate, `401` bad signature, `503` sender keys unreachable (retry later), `413` too large.
 
-Read the article [Modern email can be built from borrowed parts](https://en.andros.dev/blog/d7ed8b07/modern-email-can-be-built-from-borrowed-parts/) for more explanations.
+The exact wire format (canonical JSON, ids, signatures, sealing, status codes, verification duties) is specified in [SPEC.md](SPEC.md), including a test vector for writing interoperable implementations in other languages. Read the article [Modern email can be built from borrowed parts](https://en.andros.dev/blog/d7ed8b07/modern-email-can-be-built-from-borrowed-parts/) for the design rationale.
 
 ## Quickstart
 

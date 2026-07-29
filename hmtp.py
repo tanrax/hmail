@@ -41,6 +41,7 @@ from waitress import serve as waitress_serve
 HOME = Path(os.environ.get("HMTP_HOME", Path.home() / ".hmtp"))
 INSECURE = os.environ.get("HMTP_INSECURE") == "1"  # plain HTTP, local tests only
 HOST = os.environ.get("HMTP_HOST", "127.0.0.1")  # 0.0.0.0 inside containers
+VERSION = 1  # wire protocol version, see SPEC.md
 MAX_SIZE = 64_000
 MAX_BACKOFF = 86_400  # retry at most once a day
 # Anything that can go wrong while resolving, fetching or checking a peer.
@@ -75,7 +76,11 @@ def b64(data: bytes) -> str:
 
 
 def canonical(payload: dict) -> bytes:
-    return json.dumps(payload, sort_keys=True, separators=(",", ":")).encode()
+    """RFC 8785 (JCS) canonical form for HMTP's field names: sorted keys,
+    no insignificant whitespace, minimal escaping, UTF-8 bytes."""
+    return json.dumps(
+        payload, sort_keys=True, separators=(",", ":"), ensure_ascii=False
+    ).encode()
 
 
 def message_id(payload: dict) -> str:
@@ -218,8 +223,10 @@ def inbox(user: str):
     if request.content_length and request.content_length > MAX_SIZE:
         return jsonify(error="message too large"), 413
     msg = request.get_json(silent=True) or {}
+    if msg.get("v") != VERSION:
+        return jsonify(error="unsupported protocol version"), 400
     malformed = any(k not in msg for k in ("id", "from", "to", "date", "signature"))
-    if malformed or ("sealed" not in msg and "content" not in msg):
+    if malformed or ("sealed" in msg) == ("content" in msg):  # exactly one
         return jsonify(error="malformed message"), 400
     try:
         verify(msg)
@@ -249,9 +256,18 @@ def inbox(user: str):
     return jsonify(delivered=msg["id"]), 201 if inserted else 200
 
 
+def post_message(inbox_url: str, wire: dict) -> None:
+    httpx.post(
+        inbox_url,
+        content=json.dumps(wire),
+        headers={"Content-Type": "application/hmtp+json"},
+        timeout=10,
+    ).raise_for_status()
+
+
 def deliver(recipient: str, wire: dict) -> None:
     doc = httpx.get(wellknown_url(recipient), timeout=10).json()
-    httpx.post(doc["inbox"], json=wire, timeout=10).raise_for_status()
+    post_message(doc["inbox"], wire)
 
 
 def send(
@@ -272,6 +288,7 @@ def send(
     # keeps the visible id from confirming a guessed short plaintext.
     content = {"subject": subject or "", "body": text, "salt": b64(os.urandom(16))}
     payload = {
+        "v": VERSION,
         "from": cfg["address"],
         "to": [recipient],
         "date": datetime.now(timezone.utc).isoformat(timespec="seconds"),
@@ -294,7 +311,7 @@ def send(
     try:
         if doc is None:
             raise ValueError("recipient node unreachable")
-        httpx.post(doc["inbox"], json=wire, timeout=10).raise_for_status()
+        post_message(doc["inbox"], wire)
         print(f"delivered {wire['id']}")
     except PEER_ERRORS as exc:
         conn.execute(
