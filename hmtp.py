@@ -54,7 +54,7 @@ def db() -> sqlite3.Connection:
     conn.execute(
         "CREATE TABLE IF NOT EXISTS messages ("
         "id TEXT PRIMARY KEY, sender TEXT, recipient TEXT, date TEXT,"
-        "subject TEXT, body TEXT, box TEXT,"  # box: 'inbox' or 'requests'
+        "payload TEXT, box TEXT,"  # box: 'inbox' or 'requests'
         "in_reply_to TEXT)"
     )
     conn.execute("CREATE TABLE IF NOT EXISTS contacts (address TEXT PRIMARY KEY)")
@@ -82,6 +82,14 @@ def message_id(payload: dict) -> str:
     return "sha256:" + hashlib.sha256(canonical(payload)).hexdigest()
 
 
+def plaintext_core(msg: dict, content: dict) -> dict:
+    """The message id hashes this: the visible envelope plus the plaintext
+    content, before any sealing. Every copy of a message shares it, so
+    thread references match across nodes and retries stay idempotent."""
+    envelope = {k: msg[k] for k in ("from", "to", "date", "in_reply_to") if k in msg}
+    return envelope | content
+
+
 def guard_host(host: str) -> None:
     """Refuse to talk to private networks (SSRF guard)."""
     if INSECURE:
@@ -99,10 +107,15 @@ def wellknown_url(address: str) -> str:
 
 
 def verify(msg: dict) -> None:
-    """Check that the message id matches its content and the signature
-    matches the signing key published on the sender's domain."""
-    payload = {k: v for k, v in msg.items() if k not in ("id", "signature")}
-    if message_id(payload) != msg["id"]:
+    """Check the signature against the signing key published on the sender's
+    domain. The id hashes the plaintext, so when the content is sealed only
+    the recipient can check it (and does, on read); for plaintext content
+    the server checks it right here."""
+    payload = {k: v for k, v in msg.items() if k != "signature"}
+    if (
+        "content" in msg
+        and message_id(plaintext_core(msg, msg["content"])) != msg["id"]
+    ):
         raise ValueError("id does not match content")
     doc = httpx.get(wellknown_url(msg["from"]), timeout=10).json()
     key = ed25519.Ed25519PublicKey.from_public_bytes(
@@ -121,8 +134,9 @@ def _sealing_key(shared: bytes, ephemeral_pub: bytes, recipient_pub: bytes) -> b
 
 
 def seal(text: str, recipient_key_b64: str) -> dict:
-    """Encrypt the body to the recipient's X25519 key (sealed box):
-    only the holder of the private key can read it, servers included."""
+    """Encrypt the content (subject and body) to the recipient's X25519 key
+    (sealed box): only the holder of the private key can read it, servers
+    included."""
     recipient_pub = base64.b64decode(recipient_key_b64)
     recipient_key = x25519.X25519PublicKey.from_public_bytes(recipient_pub)
     ephemeral = x25519.X25519PrivateKey.generate()
@@ -138,14 +152,14 @@ def seal(text: str, recipient_key_b64: str) -> dict:
     }
 
 
-def unseal(body: dict, cfg: dict) -> str:
+def unseal(sealed: dict, cfg: dict) -> str:
     """Decrypt with the current encryption key, falling back to rotated-out
     ones so old mail stays readable after a key rotation."""
     keypairs = [
         (cfg["encryption_private_key"], cfg["encryption_public_key"]),
         *cfg.get("previous_encryption_keys", []),
     ]
-    ephemeral_pub = base64.b64decode(body["ephemeral_key"])
+    ephemeral_pub = base64.b64decode(sealed["ephemeral_key"])
     for private_b64, public_b64 in keypairs:
         private = x25519.X25519PrivateKey.from_private_bytes(
             base64.b64decode(private_b64)
@@ -158,8 +172,8 @@ def unseal(body: dict, cfg: dict) -> str:
             return (
                 ChaCha20Poly1305(key)
                 .decrypt(
-                    base64.b64decode(body["nonce"]),
-                    base64.b64decode(body["data"]),
+                    base64.b64decode(sealed["nonce"]),
+                    base64.b64decode(sealed["data"]),
                     None,
                 )
                 .decode()
@@ -167,6 +181,18 @@ def unseal(body: dict, cfg: dict) -> str:
         except InvalidTag:
             continue
     raise ValueError("no encryption key can decrypt this message")
+
+
+def open_message(msg: dict, cfg: dict) -> dict:
+    """Return the plaintext content of a stored message, checking that the
+    id really is the hash of that plaintext."""
+    if "sealed" in msg:
+        content = json.loads(unseal(msg["sealed"], cfg))
+    else:
+        content = msg["content"]
+    if message_id(plaintext_core(msg, content)) != msg["id"]:
+        raise ValueError("id does not match content")
+    return content
 
 
 @app.get("/.well-known/hmtp/<user>")
@@ -192,7 +218,8 @@ def inbox(user: str):
     if request.content_length and request.content_length > MAX_SIZE:
         return jsonify(error="message too large"), 413
     msg = request.get_json(silent=True) or {}
-    if any(k not in msg for k in ("id", "from", "to", "date", "body", "signature")):
+    malformed = any(k not in msg for k in ("id", "from", "to", "date", "signature"))
+    if malformed or ("sealed" not in msg and "content" not in msg):
         return jsonify(error="malformed message"), 400
     try:
         verify(msg)
@@ -201,23 +228,19 @@ def inbox(user: str):
         return jsonify(error="sender keys unreachable"), 503
     except (ValueError, KeyError, InvalidSignature):
         return jsonify(error="signature verification failed"), 401
-    body = msg["body"]
-    if isinstance(body, dict):
-        body = json.dumps(body)
     conn = db()
     known = conn.execute(
         "SELECT 1 FROM contacts WHERE address = ?", (msg["from"],)
     ).fetchone()
     box = "inbox" if known else "requests"
     inserted = conn.execute(
-        "INSERT OR IGNORE INTO messages VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+        "INSERT OR IGNORE INTO messages VALUES (?, ?, ?, ?, ?, ?, ?)",
         (
             msg["id"],
             msg["from"],
             user,
             msg["date"],
-            msg.get("subject", ""),
-            body,
+            json.dumps(msg),
             box,
             msg.get("in_reply_to"),
         ),
@@ -245,23 +268,23 @@ def send(
         doc = httpx.get(wellknown_url(recipient), timeout=10).json()
     except PEER_ERRORS:
         doc = None
-    body: str | dict = text
-    if doc and doc.get("encryption_key"):
-        body = seal(text, doc["encryption_key"])
+    # Subject and body travel together inside the sealed payload; the salt
+    # keeps the visible id from confirming a guessed short plaintext.
+    content = {"subject": subject or "", "body": text, "salt": b64(os.urandom(16))}
     payload = {
         "from": cfg["address"],
         "to": [recipient],
         "date": datetime.now(timezone.utc).isoformat(timespec="seconds"),
-        "body": body,
     }
-    if subject:
-        payload["subject"] = subject
     if in_reply_to:
         payload["in_reply_to"] = in_reply_to
-    wire = payload | {
-        "id": message_id(payload),
-        "signature": b64(key.sign(canonical(payload))),
-    }
+    # The id hashes the plaintext, computed before sealing.
+    payload["id"] = message_id(plaintext_core(payload, content))
+    if doc and doc.get("encryption_key"):
+        payload["sealed"] = seal(json.dumps(content), doc["encryption_key"])
+    else:
+        payload["content"] = content
+    wire = payload | {"signature": b64(key.sign(canonical(payload)))}
     conn = db()
     # Writing to someone means their replies are welcome in your inbox.
     conn.execute("INSERT OR IGNORE INTO contacts VALUES (?)", (recipient,))
@@ -336,16 +359,16 @@ def list_messages() -> None:
     for box in ("inbox", "requests"):
         print(f"== {box} ==")
         rows = conn.execute(
-            "SELECT id, date, sender, subject, body, in_reply_to FROM messages"
+            "SELECT id, date, sender, payload, in_reply_to FROM messages"
             " WHERE box = ? ORDER BY date",
             (box,),
         ).fetchall()
-        for mid, date, sender, subject, body, in_reply_to in rows:
-            if body.startswith('{"cipher'):
-                try:
-                    body = unseal(json.loads(body), cfg)
-                except (InvalidTag, ValueError, KeyError):
-                    body = "[cannot decrypt]"
+        for mid, date, sender, payload, in_reply_to in rows:
+            try:
+                content = open_message(json.loads(payload), cfg)
+                subject, body = content["subject"], content["body"]
+            except (InvalidTag, ValueError, KeyError):
+                subject, body = "", "[cannot decrypt or id does not match]"
             thread = f" reply-to {in_reply_to[:19]}" if in_reply_to else ""
             print(f"[{date}] {sender} {subject} ({mid[:19]}){thread}")
             print(f"  {body}")
@@ -355,7 +378,7 @@ def reply(target: str, text: str) -> None:
     prefix = target.removeprefix("sha256:")
     conn = db()
     rows = conn.execute(
-        "SELECT id, sender, subject FROM messages WHERE id LIKE ?",
+        "SELECT id, sender, payload FROM messages WHERE id LIKE ?",
         (f"sha256:{prefix}%",),
     ).fetchall()
     if not rows:
@@ -366,7 +389,11 @@ def reply(target: str, text: str) -> None:
         for row in rows:
             print(f"  {row[0]}")
         return
-    mid, sender, subject = rows[0]
+    mid, sender, payload = rows[0]
+    try:
+        subject = open_message(json.loads(payload), config())["subject"]
+    except (InvalidTag, ValueError, KeyError):
+        subject = ""
     if subject and not subject.startswith("Re: "):
         subject = f"Re: {subject}"
     send(sender, text, subject=subject or None, in_reply_to=mid)
@@ -377,7 +404,7 @@ def rotate() -> None:
     so the new one is trusted immediately and the old one is useless to a
     thief the moment this returns. Old encryption keys are kept so `list`
     can still decrypt mail sealed to them, and queued outgoing mail is
-    re-signed (its id is a content hash, so deduplication is unaffected)."""
+    re-signed (its id hashes the plaintext, so it is unaffected)."""
     cfg = config()
     signing = ed25519.Ed25519PrivateKey.generate()
     encryption = x25519.X25519PrivateKey.generate()
@@ -393,11 +420,8 @@ def rotate() -> None:
     rows = conn.execute("SELECT id, payload FROM outbox").fetchall()
     for mid, payload in rows:
         wire = json.loads(payload)
-        core = {k: v for k, v in wire.items() if k not in ("id", "signature")}
-        wire = core | {
-            "id": message_id(core),
-            "signature": b64(signing.sign(canonical(core))),
-        }
+        core = {k: v for k, v in wire.items() if k != "signature"}
+        wire = core | {"signature": b64(signing.sign(canonical(core)))}
         conn.execute(
             "UPDATE outbox SET payload = ? WHERE id = ?", (json.dumps(wire), mid)
         )

@@ -19,7 +19,7 @@ HMTP is a thought experiment turned into working code: what would email look lik
 
 It never talks to SMTP: it only federates with other HMTP nodes.
 
-Your identity is `user@domain`. The domain serves `GET /.well-known/hmtp/<user>` with your inbox URL and your public signing key (this doubles as an MX record: the inbox can live on any host). A message is a JSON object `{from, to, date, body}` whose `id` is the SHA-256 of its canonical form and which carries an Ed25519 `signature`. Delivery is a `POST` to the recipient's inbox. The receiver recomputes the id, fetches the sender's key from the sender's domain, and verifies. If the recipient publishes an encryption key, the body is sealed to it with an X25519 sealed box (ChaCha20-Poly1305): the receiving server stores ciphertext it cannot read. `201` delivered, `200` duplicate, `401` bad signature, `503` sender keys unreachable (retry later), `413` too large.
+Your identity is `user@domain`. The domain serves `GET /.well-known/hmtp/<user>` with your inbox URL and your public keys (this doubles as an MX record: the inbox can live on any host). A message is a visible envelope `{from, to, date}` plus a sealed payload carrying the subject and the body, encrypted to the recipient's X25519 key (ChaCha20-Poly1305): the receiving server stores ciphertext it cannot read, and the subject travels as protected as the body (PGP left it in the clear for decades; we don't). The `id` is the SHA-256 of the canonical plaintext, computed before sealing, so every copy of a message shares the same id, thread references match across nodes and retries are idempotent. The Ed25519 `signature` covers the envelope, the id and the ciphertext: the receiver fetches the sender's key from the sender's domain and verifies before accepting, and the recipient re-checks the id against the plaintext after unsealing. Delivery is a `POST` to the recipient's inbox. `201` delivered, `200` duplicate, `401` bad signature, `503` sender keys unreachable (retry later), `413` too large.
 
 Read the article [Modern email can be built from borrowed parts](https://en.andros.dev/blog/d7ed8b07/modern-email-can-be-built-from-borrowed-parts/) for more explanations.
 
@@ -65,7 +65,7 @@ uv run hmtp.py send me@localhost:8025 "Hello, world. Signed and delivered."
 # delivered sha256:a39442a5ad64f1351892200b41da1b21f332de9fb234d54727c2e0ddefef5f6e
 ```
 
-Yes, you just mailed yourself, and that exercised the whole protocol: the sender discovered the inbox through the `.well-known` document, sealed the body to your published encryption key, signed the message with your Ed25519 key, delivered it with a POST, and the receiving side fetched the key back from the sender's address and verified the signature before accepting. On disk, the body is ciphertext; only `list` can read it.
+Yes, you just mailed yourself, and that exercised the whole protocol: the sender discovered the inbox through the `.well-known` document, sealed the subject and the body to your published encryption key, signed the message with your Ed25519 key, delivered it with a POST, and the receiving side fetched the key back from the sender's address and verified the signature before accepting. On disk, subject and body are ciphertext; only `list` can read them.
 
 ### 3. Read your mail
 
@@ -254,7 +254,7 @@ From anywhere, your identity document must be public:
 
 ```bash
 curl https://yourdomain.com/.well-known/hmtp/you
-# {"address": "you@yourdomain.com", "inbox": "https://yourdomain.com/hmtp/inbox/you", "signing_key": "..."}
+# {"address": "you@yourdomain.com", "inbox": "https://yourdomain.com/hmtp/inbox/you", "signing_key": "...", "encryption_key": "..."}
 ```
 
 And from the server, mail yourself through the full public loop (discovery, signature, delivery, verification).
@@ -307,7 +307,7 @@ State lives in `$HMTP_HOME` (default `~/.hmtp`): `config.json` holds your keys, 
 
 ## What is deliberately left out
 
-One piece of the design is left out on purpose: the key rotation *chain* (the `.well-known` document publishes a single signing key, with no signed history). Receivers fetch your current key on every delivery instead of pinning it, so rotation is already a first-class command (`hmtp.py rotate`, see Production); a chain of signed rotations only starts paying for itself once nodes cache keys. Everything else is in: end-to-end encryption, subjects and threading, exponential backoff, a production WSGI server. It still fits in one file you can read in one sitting. A protocol you cannot extend on a Sunday afternoon would not deserve the experiment.
+Four pieces of the design are left out on purpose, all periphery: the key rotation *chain* (the `.well-known` document publishes a single signing key, with no signed history; receivers fetch your current key on every delivery instead of pinning it, so rotation is already a first-class command and a chain of signed rotations only starts paying for itself once nodes cache keys), the `402` postage for strangers, attachments by reference, and JMAP reading. Everything else is in: end-to-end encryption of subject and body, threading, first-contact consent, deduplication, exponential backoff, a production WSGI server. It still fits in one file you can read in one sitting. A protocol you cannot extend on a Sunday afternoon would not deserve the experiment.
 
 ## License
 
