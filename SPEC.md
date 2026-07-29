@@ -2,7 +2,7 @@
 
 **Version 1** (the `v` field of every message).
 
-HMTP (HTTP Mail Transfer Protocol) is a convention over HTTPS for delivering signed, end-to-end encrypted mail between independent nodes. This document is the normative wire specification: everything an implementation needs to interoperate with other nodes without reading the reference code. The design rationale lives in the article [Modern email can be built from borrowed parts](https://en.andros.dev/blog/d7ed8b07/modern-email-can-be-built-from-borrowed-parts/); how to run the reference node lives in the [README](README.md).
+HMTP (HTTP Mail Transfer Protocol) is a convention over HTTPS for delivering signed, end-to-end encrypted mail between independent nodes. This document is the normative wire specification: everything an implementation needs to interoperate with other nodes without reading the reference code. How to run the reference node lives in the [README](README.md).
 
 The key words MUST, MUST NOT, SHOULD and MAY are to be interpreted as described in RFC 2119.
 
@@ -246,7 +246,7 @@ The sketch: a receiver MAY answer a **first contact** (sender not in its contact
 
 ### Multi-device
 
-The article's discovery example reserves a `devices` field that version 1 omits on purpose. The direction: the discovery document would publish one encryption key per device and the sender would seal one copy of the content to each key. The id, being a hash of the plaintext, is unaffected; the shape of `sealed` is what a future version would extend, under a new `v`. The duty this leaves on version 1 is extensibility: implementations MUST ignore unknown fields in discovery documents and messages rather than reject them.
+Version 1 assumes one encryption key per user. The direction: the discovery document would grow a `devices` field publishing one encryption key per device, and the sender would seal one copy of the content to each key. The id, being a hash of the plaintext, is unaffected; the shape of `sealed` is what a future version would extend, under a new `v`. The duty this leaves on version 1 is extensibility: implementations MUST ignore unknown fields in discovery documents and messages rather than reject them.
 
 ### Attachments
 
