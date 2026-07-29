@@ -23,7 +23,9 @@ It never talks to SMTP: it only federates with other HMTP nodes.
 
 Your identity is `user@domain`. The domain serves `GET /.well-known/hmtp/<user>` with your inbox URL and your public keys (this doubles as an MX record: the inbox can live on any host). A message is a visible envelope `{from, to, date}` plus a sealed payload carrying the subject and the body, encrypted to the recipient's X25519 key (ChaCha20-Poly1305): the receiving server stores ciphertext it cannot read, and the subject travels as protected as the body (PGP left it in the clear for decades; we don't). The `id` is the SHA-256 of the canonical plaintext, computed before sealing, so every copy of a message shares the same id, thread references match across nodes and retries are idempotent. The Ed25519 `signature` covers the envelope, the id and the ciphertext: the receiver fetches the sender's key from the sender's domain and verifies before accepting, and the recipient re-checks the id against the plaintext after unsealing. Delivery is a `POST` to the recipient's inbox. `201` delivered, `200` duplicate, `401` bad signature, `503` sender keys unreachable (retry later), `413` too large.
 
-The exact wire format (canonical JSON, ids, signatures, sealing, status codes, verification duties) is specified in [SPEC.md](SPEC.md), including a test vector for writing interoperable implementations in other languages. Read the article [Modern email can be built from borrowed parts](https://en.andros.dev/blog/d7ed8b07/modern-email-can-be-built-from-borrowed-parts/) for the design rationale.
+Version 1 also covers encrypted attachments by reference (blobs mirrored by the recipient's server at delivery, deferred for strangers), optional postage stamps for strangers (`402`), a signing-key rotation chain with per-sender continuity pins, per-device sealed copies, and a token-authenticated read endpoint for your devices.
+
+The exact wire format (canonical JSON, ids, signatures, sealing, attachments, postage, rotation, status codes, verification duties) is specified in [SPEC.md](SPEC.md), including a test vector for writing interoperable implementations in other languages. Read the article [Modern email can be built from borrowed parts](https://en.andros.dev/blog/d7ed8b07/modern-email-can-be-built-from-borrowed-parts/) for the design rationale.
 
 ## Quickstart
 
@@ -297,19 +299,25 @@ You are now a mail server. Total moving parts: Nginx, one script, SQLite.
 ```
 hmtp.py init <address> <public-base-url>       create identity and database
 hmtp.py serve [port]                           run the node (default 8025)
-hmtp.py send <address> [-s <subject>] <text>   sign, encrypt and deliver
+hmtp.py send <address> [-s <subject>] [-a <file>]... [--stamp <token>] <text>
 hmtp.py reply <message-id> <text>              reply to a message (threaded)
+hmtp.py attachments <message-id> [dir]         save and decrypt attachments
 hmtp.py flush                                  retry queued deliveries
 hmtp.py list                                   show inbox and contact requests
 hmtp.py accept <address>                       accept a contact request
 hmtp.py rotate                                 replace signing and encryption keys
+hmtp.py postage on|off                         require stamps from strangers
+hmtp.py stamp                                  issue a single-use postage stamp
+hmtp.py token                                  print the mailbox read token
+hmtp.py device keygen                          generate a key pair for a device
+hmtp.py device add <name> <public-key>         publish a device encryption key
 ```
 
 State lives in `$HMTP_HOME` (default `~/.hmtp`): `config.json` holds your keys, `hmtp.db` holds your mail. Back up both.
 
 ## What is deliberately left out
 
-Four pieces of the design are left out on purpose, all periphery: the key rotation *chain* (the `.well-known` document publishes a single signing key, with no signed history; receivers fetch your current key on every delivery instead of pinning it, so rotation is already a first-class command and a chain of signed rotations only starts paying for itself once nodes cache keys), the `402` postage for strangers, attachments by reference, and JMAP reading. Everything else is in: end-to-end encryption of subject and body, threading, first-contact consent, deduplication, exponential backoff, a production WSGI server. It still fits in one file you can read in one sitting. A protocol you cannot extend on a Sunday afternoon would not deserve the experiment.
+The remaining edges, listed in SPEC.md section 16: full JMAP synchronization (the read endpoint is deliberately minimal), payment rails for stamps (issuance is out of band), chunked encryption for large attachments, automated device enrollment, and timed re-anchor announcements. Everything else is in: end-to-end encryption of subject, body and attachments, threading, first-contact consent, postage for strangers, deduplication, exponential backoff, a signing-key rotation chain with continuity pins, multi-device copies, a production WSGI server. It still fits in one file you can read in one sitting. A protocol you cannot extend on a Sunday afternoon would not deserve the experiment.
 
 ## License
 

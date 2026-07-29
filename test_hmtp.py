@@ -7,10 +7,11 @@ gets its own home directory (keys and database) under tmp_path.
 
 import base64
 import json
+import os
 from types import SimpleNamespace
 
 import pytest
-from cryptography.hazmat.primitives.asymmetric import ed25519
+from cryptography.hazmat.primitives.asymmetric import ed25519, x25519
 
 import hmtp
 
@@ -19,7 +20,8 @@ class FakeResponse:
     def __init__(self, response):
         self._response = response
         self.status_code = response.status_code
-        self.text = response.get_data(as_text=True)
+        self.content = response.get_data()
+        self.text = self.content.decode("utf-8", errors="replace")
 
     def json(self):
         return self._response.get_json()
@@ -68,7 +70,7 @@ def network(tmp_path, monkeypatch):
 
     content_types = []
 
-    def dispatch(url, method, body=None, content_type=None):
+    def dispatch(url, method, body=None, headers=None):
         host, _, path = url.split("://", 1)[1].partition("/")
         target = nodes[host]  # KeyError = host down, a PEER_ERRORS member
         caller_home = hmtp.HOME
@@ -76,8 +78,12 @@ def network(tmp_path, monkeypatch):
         try:
             if method == "get":
                 return FakeResponse(client.get(f"/{path}"))
+            headers = dict(headers or {})
+            content_type = headers.pop("Content-Type", "application/json")
             return FakeResponse(
-                client.post(f"/{path}", data=body, content_type=content_type)
+                client.post(
+                    f"/{path}", data=body, content_type=content_type, headers=headers
+                )
             )
         finally:
             hmtp.HOME = caller_home
@@ -89,7 +95,7 @@ def network(tmp_path, monkeypatch):
     def fake_post(url, content=None, headers=None, timeout=None):
         wires.append(json.loads(content))
         content_types.append(headers["Content-Type"])
-        return dispatch(url, "post", content, headers["Content-Type"])
+        return dispatch(url, "post", content, headers)
 
     monkeypatch.setattr(hmtp.httpx, "post", fake_post)
 
@@ -294,6 +300,139 @@ def test_rejected_mail_is_dropped_not_retried(network, ana, bob):
 
     assert ana.rows("SELECT id FROM outbox") == []  # dropped, not requeued
     assert bob.stored_messages() == []
+
+
+def boxes_by_body(node):
+    return {node.open(msg)["body"]: box for _, box, msg in node.stored_messages()}
+
+
+def test_rotation_chain_preserves_trust(network, ana, bob):
+    bob.run(hmtp.accept, ana.address)
+    ana.run(hmtp.send, bob.address, "before rotation")  # pins ana's key on bob
+
+    ana.run(hmtp.rotate)
+    ana.run(hmtp.send, bob.address, "after rotation")
+
+    assert boxes_by_body(bob) == {
+        "before rotation": "inbox",
+        "after rotation": "inbox",
+    }
+
+
+def test_reanchored_identity_is_demoted_to_requests(network, ana, bob):
+    bob.run(hmtp.accept, ana.address)
+    ana.run(hmtp.send, bob.address, "legit")
+
+    # The domain re-anchors: brand-new keys, no signed chain to the old one.
+    hmtp.HOME = ana.home
+    hmtp.init(ana.address, f"http://{ana.host}")
+    ana.run(hmtp.send, bob.address, "who am I now?")
+
+    assert boxes_by_body(bob)["who am I now?"] == "requests"
+
+    bob.run(hmtp.accept, ana.address)  # re-trust pins the new key
+    ana.run(hmtp.send, bob.address, "trusted again")
+    assert boxes_by_body(bob)["trusted again"] == "inbox"
+
+
+def test_stranger_needs_a_stamp_when_postage_is_on(network, ana, bob, capsys):
+    bob.run(hmtp.postage, "on")
+
+    ana.run(hmtp.send, bob.address, "cold call")
+
+    assert bob.stored_messages() == []  # 402: dropped, not stored
+    assert ana.rows("SELECT id FROM outbox") == []  # and not queued either
+
+    capsys.readouterr()
+    bob.run(hmtp.issue_stamp)
+    token = capsys.readouterr().out.strip()
+
+    ana.run(hmtp.send, bob.address, "cold call, stamped", stamp=token)
+    assert len(bob.stored_messages()) == 1
+
+    ana.run(hmtp.send, bob.address, "reusing the stamp", stamp=token)
+    assert len(bob.stored_messages()) == 1  # stamps are single-use
+
+
+def test_attachments_are_sealed_mirrored_and_recoverable(network, ana, bob, tmp_path):
+    secret = os.urandom(1000)
+    source = tmp_path / "plan.pdf"
+    source.write_bytes(secret)
+    bob.run(hmtp.accept, ana.address)  # known contact: mirror at delivery
+
+    ana.run(hmtp.send, bob.address, "see attachment", attachments=[str(source)])
+
+    wire = network.wires[-1]
+    visible = wire["attachments"][0]
+    assert "key" not in visible and "name" not in visible  # envelope leaks neither
+    digest = visible["hash"].removeprefix("sha256:")
+    assert (bob.home / "blobs" / digest).exists()  # mirrored at delivery
+
+    out = tmp_path / "saved"
+    out.mkdir()
+    bob.run(hmtp.save_attachments, wire["id"], str(out))
+    assert (out / "plan.pdf").read_bytes() == secret
+
+
+def test_stranger_attachments_mirror_only_after_accept(network, ana, bob, tmp_path):
+    source = tmp_path / "cat.jpg"
+    source.write_bytes(b"x" * 100)
+
+    ana.run(hmtp.send, bob.address, "hi stranger", attachments=[str(source)])
+
+    digest = network.wires[-1]["attachments"][0]["hash"].removeprefix("sha256:")
+    assert not (bob.home / "blobs" / digest).exists()  # deferred: no consent yet
+
+    bob.run(hmtp.accept, ana.address)
+
+    assert (bob.home / "blobs" / digest).exists()
+
+
+def test_attachment_ids_cover_the_attachment_references(network, ana, bob, tmp_path):
+    source = tmp_path / "doc.txt"
+    source.write_bytes(b"data")
+
+    ana.run(hmtp.send, bob.address, "with file", attachments=[str(source)])
+
+    _, _, msg = bob.stored_messages()[0]
+    content = bob.open(msg)  # would raise if the id did not cover the refs
+    assert content["attachments"][0]["name"] == "doc.txt"
+    assert hmtp.message_id(hmtp.plaintext_core(msg, content)) == msg["id"]
+
+
+def test_mailbox_endpoint_requires_the_read_token(network, ana, bob):
+    ana.run(hmtp.send, bob.address, "hello")
+    token = bob.run(hmtp.config)["read_token"]
+
+    hmtp.HOME = bob.home
+    denied = network.client.get(
+        f"/hmtp/mailbox/{bob.user}", headers={"Authorization": "Bearer wrong"}
+    )
+    assert denied.status_code == 401
+
+    hmtp.HOME = bob.home
+    granted = network.client.get(
+        f"/hmtp/mailbox/{bob.user}", headers={"Authorization": f"Bearer {token}"}
+    )
+    assert granted.status_code == 200
+    assert len(granted.get_json()["requests"]) == 1  # still sealed, box intact
+
+
+def test_devices_get_their_own_sealed_copy(network, ana, bob):
+    device = x25519.X25519PrivateKey.generate()
+    bob.run(hmtp.device_add, "laptop", hmtp.b64(device.public_key().public_bytes_raw()))
+
+    ana.run(hmtp.send, bob.address, "for all my devices")
+
+    wire = network.wires[-1]
+    device_cfg = {
+        "encryption_private_key": hmtp.b64(device.private_bytes_raw()),
+        "encryption_public_key": hmtp.b64(device.public_key().public_bytes_raw()),
+    }
+    content = json.loads(hmtp.unseal(wire["sealed_devices"]["laptop"], device_cfg))
+    assert content["body"] == "for all my devices"
+    _, _, msg = bob.stored_messages()[0]
+    assert bob.open(msg)["body"] == "for all my devices"  # primary copy intact
 
 
 def test_queued_mail_is_delivered_on_flush(network, ana, bob):
