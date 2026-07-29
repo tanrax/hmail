@@ -223,4 +223,16 @@ An implementation that reproduces the id and the signature byte for byte (Ed2551
 
 ## 12. Out of scope in version 1
 
-Decided and documented, not implemented: signed key-rotation chains, `402` postage for strangers, attachments by reference (encrypted blobs, mirrored at delivery), JMAP reading, multi-device. The article explains each decision.
+Decided and documented, not implemented: signed key-rotation chains, `402` postage for strangers, attachments by reference, JMAP reading, multi-device.
+
+### Attachments (design sketch, non-normative)
+
+Version 1 messages are text only, capped by the receiver's size limit. The designed mechanism keeps attachments **outside the message**, by reference:
+
+- The sender encrypts the file with a fresh single-use symmetric key and publishes the resulting opaque blob at a URL on its own server.
+- The reference `{hash, url, size, key}` travels **inside the sealed content**, so end-to-end encryption covers attachments too (the same pattern Matrix uses for media).
+- The `hash` is of the encrypted blob: any server (the sender's, a mirror) can verify integrity without being able to read anything.
+- The recipient's server downloads and mirrors the blob **at delivery time, not at read time**: opening an attachment reveals nothing to the sender (no read receipts, no IP), and the sender MAY delete the original once mirrors confirm.
+- Costs flip relative to SMTP: whoever sends, hosts. Bulk mail with heavy attachments costs the spammer disk, not the victim.
+
+Keeping attachments out of the message is also what lets a message's JSON stay small (no base64 bodies) and receivers enforce an aggressive `413`. A future version will make this normative: the exact reference fields, the cipher for blobs and the mirror confirmation flow.
